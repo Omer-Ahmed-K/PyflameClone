@@ -14,7 +14,6 @@
 
 #include <getopt.h>
 
-#include <chrono>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -42,11 +41,27 @@ const char usage_str[] =
      "  -r, --rate=RATE      Sample rate, as a fractional value of seconds "
      "(default 0.001)\n"
      "  -v, --version        Show the version\n"
-     "  -x, --exclude-idle   Exclude idle time from statistics\n");
+     "  -x, --exclude-idle   Exclude idle time from statistics\n"
+     "  -t, --timestamp      Include timestamps for each stacktrace\n");
 
 typedef std::unordered_map<frames_t, size_t, FrameHash> buckets_t;
 
-void PrintBuckets(const buckets_t &buckets) {
+// Prints all stack traces
+void PrintFrames(const std::vector<FrameTS> &call_stacks, size_t idle) {
+  if (idle) {
+    std::cout << "(idle) " << idle << "\n";
+  }
+  // Put the call stacks into buckets
+  buckets_t buckets;
+  for (auto &call_stack : call_stacks) {
+    auto bucket = buckets.find(call_stack.frames);
+    if (bucket == buckets.end()) {
+      buckets.insert(bucket, {call_stack.frames, 1});
+    } else {
+      bucket->second++;
+    }
+  }
+  // process the frames
   for (const auto &kv : buckets) {
     if (kv.first.empty()) {
       std::cerr << "fatal error\n";
@@ -60,10 +75,32 @@ void PrintBuckets(const buckets_t &buckets) {
     std::cout << *last << " " << kv.second << "\n";
   }
 }
+
+// Prints all stack traces with timestamps
+void PrintFramesTS(const std::vector<FrameTS> &call_stacks) {
+  for (auto &call_stack : call_stacks) {
+    std::cout << std::chrono::duration_cast<std::chrono::microseconds>(
+                     call_stack.ts.time_since_epoch())
+                     .count()
+              << "\n";
+    // Handle idle
+    if (call_stack.frames.empty()) {
+      std::cout << "(idle)\n";
+      continue;
+    }
+    // Print the call stack
+    for (auto it = call_stack.frames.rbegin(); it != call_stack.frames.rend();
+         ++it) {
+      std::cout << *it << ";";
+    }
+    std::cout << "\n";
+  }
+}
 }  // namespace
 
 int main(int argc, char **argv) {
   bool include_idle = true;
+  bool include_ts = false;
   double seconds = 1;
   double sample_rate = 0.001;
   for (;;) {
@@ -73,9 +110,10 @@ int main(int argc, char **argv) {
         {"seconds", required_argument, 0, 's'},
         {"version", no_argument, 0, 'v'},
         {"exclude-idle", no_argument, 0, 'x'},
+        {"timestamp", no_argument, 0, 't'},
         {0, 0, 0, 0}};
     int option_index = 0;
-    int c = getopt_long(argc, argv, "hr:s:vx", long_options, &option_index);
+    int c = getopt_long(argc, argv, "hr:s:vxt", long_options, &option_index);
     if (c == -1) {
       break;
     }
@@ -104,6 +142,9 @@ int main(int argc, char **argv) {
       case 'x':
         include_idle = false;
         break;
+      case 't':
+        include_ts = true;
+        break;
       case '?':
         // getopt_long should already have printed an error message
         break;
@@ -121,61 +162,53 @@ int main(int argc, char **argv) {
     std::cerr << "PID " << pid << " is out of valid PID range.\n";
     return 1;
   }
-  buckets_t buckets;
+  std::vector<FrameTS> call_stacks;
+  size_t idle = 0;
   try {
     PtraceAttach(pid);
     Namespace ns(pid);
     const unsigned long tstate_addr = ThreadStateAddr(pid, &ns);
-    if (seconds) {
-      const std::chrono::microseconds interval{
-          static_cast<long>(sample_rate * 1000000)};
-      size_t idle = 0;
-      auto end =
-          std::chrono::system_clock::now() +
-          std::chrono::microseconds(static_cast<long>(seconds * 1000000));
-      for (;;) {
-        const unsigned long frame_addr = FirstFrameAddr(pid, tstate_addr);
-        if (frame_addr == 0) {
-          if (include_idle) {
-            idle++;
-          }
-        } else {
-          frames_t frames = GetStack(pid, frame_addr);
-          auto it = buckets.find(frames);
-          if (it == buckets.end()) {
-            buckets.insert(it, {frames, 1});
-          } else {
-            it->second++;
-          }
-        }
-        auto now = std::chrono::system_clock::now();
-        if (now + interval >= end) {
-          break;
-        }
-        PtraceDetach(pid);
-        std::this_thread::sleep_for(interval);
-        PtraceAttach(pid);
-      }
-      if (idle) {
-        std::cout << "(idle) " << idle << "\n";
-      }
-      PrintBuckets(buckets);
-    } else {
+    const std::chrono::microseconds interval{
+        static_cast<long>(sample_rate * 1000000)};
+    auto end = std::chrono::system_clock::now() +
+               std::chrono::microseconds(static_cast<long>(seconds * 1000000));
+    for (;;) {
       const unsigned long frame_addr = FirstFrameAddr(pid, tstate_addr);
-      if (frame_addr) {
-        std::vector<Frame> stack = GetStack(pid, frame_addr);
-        for (auto it = stack.rbegin(); it != stack.rend(); it++) {
-          std::cout << *it << "\n";
+      auto now = std::chrono::system_clock::now();
+      if (frame_addr == 0) {
+        if (include_idle) {
+          idle++;
+          // Time stamp empty call stacks only if required. Since lots of time
+          // the process will be idle, this is a good optimization to have
+          if (include_ts) {
+            call_stacks.push_back({now, {}});
+          }
         }
       } else {
-        std::cout << "(idle)\n";
+        frames_t frames = GetStack(pid, frame_addr);
+        call_stacks.push_back({now, frames});
       }
+      if (now + interval >= end) {
+        break;
+      }
+      PtraceDetach(pid);
+      std::this_thread::sleep_for(interval);
+      PtraceAttach(pid);
+    }
+    if (!include_ts) {
+      PrintFrames(call_stacks, idle);
+    } else {
+      PrintFramesTS(call_stacks);
     }
   } catch (const PtraceException &exc) {
-    // If the process terminates early then we just print the buckets up until
-    // that point in time.
-    if (!buckets.empty()) {
-      PrintBuckets(buckets);
+    // If the process terminates early then we just print the stack traces up
+    // until that point in time.
+    if (!call_stacks.empty() || idle) {
+      if (!include_ts) {
+        PrintFrames(call_stacks, idle);
+      } else {
+        PrintFramesTS(call_stacks);
+      }
     } else {
       std::cerr << exc.what() << std::endl;
       return 1;
